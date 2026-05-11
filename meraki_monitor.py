@@ -568,6 +568,38 @@ class MerakiClient:
         data = resp.json()
         return data if isinstance(data, list) else []
 
+    def fetch_alert_history(
+        self,
+        network_id: str,
+        stop_event: threading.Event,
+        max_pages: int = 5,
+    ) -> list[dict]:
+        """Fetch alert history (timeline) for a specific network.
+
+        Limited to `max_pages` pages (default 5 × 1000 = 5000 entries)
+        to keep response times reasonable for troubleshooting workflows.
+        """
+        if stop_event.is_set():
+            return []
+        url = f"{MERAKI_BASE_URL}/networks/{network_id}/alerts/history"
+        results: list[dict] = []
+        params: dict = {"perPage": 1000}
+        current_url = url
+        pages = 0
+
+        while current_url and pages < max_pages:
+            if stop_event.is_set():
+                return results
+            resp = self._get_with_retry(current_url, params)
+            page_data = resp.json()
+            if isinstance(page_data, list):
+                results.extend(page_data)
+            current_url = _parse_next_link(resp.headers.get("Link", ""))
+            params = {}
+            pages += 1
+
+        return results
+
     def fetch_all(
         self,
         stop_event: threading.Event,
@@ -774,6 +806,74 @@ class HealthAlertWorker(QThread):
 
             if not self._stop.is_set():
                 self.data_ready.emit(results)
+        except MerakiAPIError as exc:
+            if not self._stop.is_set():
+                self.error.emit(str(exc))
+        except Exception as exc:
+            if not self._stop.is_set():
+                self.error.emit(f"Unexpected error: {exc}")
+
+
+class TimelineWorker(QThread):
+    """Fetches alert history for given networks and filters by device serials."""
+
+    data_ready = pyqtSignal(list)  # list of timeline entries
+    error = pyqtSignal(str)
+    progress = pyqtSignal(int, int)  # (current, total)
+
+    def __init__(
+        self,
+        api_key: str,
+        org_id: str,
+        network_ids: list[str],
+        serials: set[str] | None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._api_key = api_key
+        self._org_id = org_id
+        self._network_ids = list(dict.fromkeys(network_ids))  # dedupe, preserve order
+        self._serials = set(serials) if serials else None
+        self._stop = threading.Event()
+
+    def cancel(self):
+        self._stop.set()
+
+    def run(self):
+        try:
+            client = MerakiClient(self._api_key, self._org_id)
+            entries: list[dict] = []
+            total = len(self._network_ids)
+
+            for i, net_id in enumerate(self._network_ids):
+                if self._stop.is_set():
+                    return
+                self.progress.emit(i + 1, total)
+                try:
+                    history = client.fetch_alert_history(net_id, self._stop)
+                except MerakiAPIError:
+                    history = []
+
+                for entry in history:
+                    serial = (entry.get("device") or {}).get("serial", "")
+                    # If caller asked for specific serials, filter
+                    if self._serials and serial not in self._serials:
+                        continue
+                    entries.append({
+                        "occurredAt": entry.get("occurredAt", ""),
+                        "alertType": entry.get("alertType", "")
+                            or entry.get("alertTypeId", ""),
+                        "alertTypeId": entry.get("alertTypeId", ""),
+                        "serial": serial,
+                        "networkId": net_id,
+                        "alertData": entry.get("alertData", {}) or {},
+                    })
+
+            # Sort newest-first
+            entries.sort(key=lambda e: e.get("occurredAt", ""), reverse=True)
+
+            if not self._stop.is_set():
+                self.data_ready.emit(entries)
         except MerakiAPIError as exc:
             if not self._stop.is_set():
                 self.error.emit(str(exc))
@@ -1219,6 +1319,244 @@ class HealthDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
+# Timeline Dialog
+# ---------------------------------------------------------------------------
+
+
+TIMELINE_COLUMNS: list[tuple[str, str]] = [
+    ("occurredAt", "Occurred"),
+    ("deviceName", "Device"),
+    ("serial", "Serial"),
+    ("alertType", "Alert Type"),
+    ("details", "Details"),
+]
+
+
+def _summarize_alert_data(data: dict) -> str:
+    """Render alertData dict as a compact human-readable string."""
+    if not isinstance(data, dict) or not data:
+        return ""
+    parts = []
+    for k, v in data.items():
+        if isinstance(v, (dict, list)):
+            continue
+        parts.append(f"{k}={v}")
+    return ", ".join(parts)
+
+
+class TimelineTableModel(QAbstractTableModel):
+    """Chronological alert timeline for a selection of devices."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rows: list[dict] = []
+
+    def reset_data(self, rows: list[dict]):
+        self.beginResetModel()
+        self._rows = rows
+        self.endResetModel()
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self._rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(TIMELINE_COLUMNS)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            return TIMELINE_COLUMNS[section][1]
+        return None
+
+    def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        row = self._rows[index.row()]
+        key = TIMELINE_COLUMNS[index.column()][0]
+
+        if role == Qt.ItemDataRole.DisplayRole:
+            if key == "occurredAt":
+                return _format_timestamp(row.get("occurredAt", ""))
+            if key == "details":
+                return _summarize_alert_data(row.get("alertData", {}))
+            return str(row.get(key, "") or "")
+
+        if role == Qt.ItemDataRole.UserRole + 1:
+            if key == "occurredAt":
+                return str(row.get("occurredAt", "") or "")
+            return str(row.get(key, "") or "").lower()
+
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            return Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+
+        return None
+
+
+class TimelineDialog(QDialog):
+    """Shows alert history for the selected devices."""
+
+    def __init__(
+        self,
+        api_key: str,
+        org_id: str,
+        devices: list[dict],
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._api_key = api_key
+        self._org_id = org_id
+        self._devices = devices
+        self._serial_to_name = {
+            d.get("serial", ""): d.get("name", "") for d in devices if d.get("serial")
+        }
+        self._worker: TimelineWorker | None = None
+
+        self.setWindowTitle(f"Alert Timeline — {len(devices)} device(s)")
+        self.resize(1050, 550)
+        self.setMinimumSize(700, 360)
+
+        self._setup_ui()
+        self._start_fetch()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        self._progress_label = QLabel("Fetching alert history...")
+        layout.addWidget(self._progress_label)
+
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 0)
+        layout.addWidget(self._progress_bar)
+
+        self._model = TimelineTableModel(self)
+        self._table = QTableView()
+        self._table.setModel(self._model)
+        self._table.setSortingEnabled(True)
+        self._table.setAlternatingRowColors(True)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setShowGrid(False)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.horizontalHeader().setHighlightSections(False)
+
+        widths = [170, 180, 140, 220, 320]
+        header = self._table.horizontalHeader()
+        for i, w in enumerate(widths):
+            header.resizeSection(i, w)
+
+        layout.addWidget(self._table, stretch=1)
+
+        btns = QHBoxLayout()
+        self._export_btn = QPushButton("Export CSV")
+        self._export_btn.setEnabled(False)
+        self._export_btn.clicked.connect(self._export_csv)
+        btns.addWidget(self._export_btn)
+        btns.addStretch()
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        btns.addWidget(close)
+        layout.addLayout(btns)
+
+    def _start_fetch(self):
+        network_ids = list({
+            d.get("networkId", "") for d in self._devices if d.get("networkId")
+        })
+        serials = {d.get("serial", "") for d in self._devices if d.get("serial")}
+
+        if not network_ids:
+            self._progress_label.setText("No networks to query.")
+            self._progress_bar.hide()
+            return
+
+        self._worker = TimelineWorker(
+            self._api_key, self._org_id, network_ids, serials, self
+        )
+        self._worker.data_ready.connect(self._on_data_ready)
+        self._worker.error.connect(self._on_error)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.start()
+
+    def _on_progress(self, current: int, total: int):
+        self._progress_bar.setRange(0, total)
+        self._progress_bar.setValue(current)
+        self._progress_label.setText(
+            f"Fetching alert history... ({current}/{total} networks)"
+        )
+
+    def _on_data_ready(self, entries: list[dict]):
+        # Decorate with device names for display
+        for e in entries:
+            e["deviceName"] = self._serial_to_name.get(e.get("serial", ""), "")
+        self._model.reset_data(entries)
+
+        if not entries:
+            self._progress_label.setText(
+                "No alert history found for the selected devices in the "
+                "available timeframe."
+            )
+            self._progress_label.setStyleSheet("color: #9e9e9e;")
+        else:
+            earliest = entries[-1].get("occurredAt", "")
+            latest = entries[0].get("occurredAt", "")
+            self._progress_label.setText(
+                f"{len(entries)} alert event(s) — "
+                f"{_format_timestamp(earliest)} to {_format_timestamp(latest)}"
+            )
+            self._progress_label.setStyleSheet("")
+            self._export_btn.setEnabled(True)
+
+        # Default sort: newest first (column 0 descending)
+        self._table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
+
+    def _on_error(self, message: str):
+        self._progress_label.setText(f"Error: {message}")
+        self._progress_label.setStyleSheet("color: #FF6B6B; font-weight: bold;")
+
+    def _on_finished(self):
+        self._progress_bar.hide()
+        self._worker = None
+
+    def _export_csv(self):
+        default_name = (
+            f"meraki_alert_timeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        )
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Alert Timeline", default_name,
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+                writer = csv.writer(fh)
+                writer.writerow([
+                    "Occurred", "Device Name", "Serial", "Network ID",
+                    "Alert Type", "Alert Type ID", "Details",
+                ])
+                for row in self._model._rows:
+                    writer.writerow([
+                        _format_timestamp(row.get("occurredAt", "")),
+                        row.get("deviceName", ""),
+                        row.get("serial", ""),
+                        row.get("networkId", ""),
+                        row.get("alertType", ""),
+                        row.get("alertTypeId", ""),
+                        _summarize_alert_data(row.get("alertData", {})),
+                    ])
+            self._progress_label.setText(f"Exported to {Path(path).name}")
+        except OSError as exc:
+            QMessageBox.critical(self, "Export Failed", str(exc))
+
+    def closeEvent(self, event):
+        if self._worker is not None:
+            self._worker.cancel()
+            self._worker.wait(3000)
+        event.accept()
+
+
+# ---------------------------------------------------------------------------
 # Column Chooser Dialog
 # ---------------------------------------------------------------------------
 
@@ -1460,6 +1798,9 @@ class AlertsTab(QWidget):
     # Emitted when the user asks to jump to the Devices tab filtered by a group
     show_in_devices_requested = pyqtSignal(list)  # list of serials
 
+    # Emitted when the user asks to show the alert timeline for a selection
+    show_timeline_requested = pyqtSignal(list)  # list of device dicts
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._groups_model = AlertGroupsModel(self)
@@ -1498,6 +1839,11 @@ class AlertsTab(QWidget):
         self._summary_label = QLabel("No alerts loaded.")
         self._summary_label.setStyleSheet("color: #9e9e9e;")
         filter_row.addWidget(self._summary_label)
+
+        self._export_btn = QPushButton("Export CSV")
+        self._export_btn.setEnabled(False)
+        self._export_btn.clicked.connect(self._export_csv)
+        filter_row.addWidget(self._export_btn)
 
         layout.addLayout(filter_row)
 
@@ -1566,6 +1912,13 @@ class AlertsTab(QWidget):
         # Jump-to-devices button
         btn_row = QHBoxLayout()
         btn_row.addStretch()
+        self._timeline_btn = QPushButton("Show Timeline…")
+        self._timeline_btn.setEnabled(False)
+        self._timeline_btn.setToolTip(
+            "Show alert history for the devices affected by the selected alert"
+        )
+        self._timeline_btn.clicked.connect(self._show_timeline)
+        btn_row.addWidget(self._timeline_btn)
         self._show_in_devices_btn = QPushButton("Show in Devices Tab →")
         self._show_in_devices_btn.setEnabled(False)
         self._show_in_devices_btn.clicked.connect(self._emit_show_in_devices)
@@ -1590,6 +1943,7 @@ class AlertsTab(QWidget):
             self._devices_model.reset_data([])
             self._affected_label.setText("Affected Devices")
             self._show_in_devices_btn.setEnabled(False)
+            self._timeline_btn.setEnabled(False)
             return
 
         devices = group.get("devices", [])
@@ -1599,6 +1953,7 @@ class AlertsTab(QWidget):
             f"Affected Devices — {label} ({len(devices)})"
         )
         self._show_in_devices_btn.setEnabled(bool(devices))
+        self._timeline_btn.setEnabled(bool(devices))
 
     def _on_group_double_clicked(self, _index: QModelIndex):
         self._emit_show_in_devices()
@@ -1607,8 +1962,11 @@ class AlertsTab(QWidget):
         sel = self._groups_view.selectionModel().selectedRows()
         if not sel:
             return None
-        source_idx = self._groups_proxy.mapToSource(sel[0])
+        source_idx = self._proxy_for_source(sel[0])
         return self._groups_model.group_at(source_idx.row())
+
+    def _proxy_for_source(self, proxy_idx: QModelIndex) -> QModelIndex:
+        return self._groups_proxy.mapToSource(proxy_idx)
 
     def _emit_show_in_devices(self):
         group = self._current_group()
@@ -1617,6 +1975,18 @@ class AlertsTab(QWidget):
         serials = [d.get("serial", "") for d in group.get("devices", []) if d.get("serial")]
         if serials:
             self.show_in_devices_requested.emit(serials)
+
+    def _show_timeline(self):
+        # Use selected rows from the affected-devices table if any; otherwise
+        # fall back to all devices in the group.
+        sel = self._devices_view.selectionModel().selectedRows()
+        if sel:
+            rows = [self._devices_model._rows[i.row()] for i in sel]
+        else:
+            group = self._current_group()
+            rows = group.get("devices", []) if group else []
+        if rows:
+            self.show_timeline_requested.emit(rows)
 
     def update_data(self, devices: list[dict]):
         """Rebuild the alert groups from the device list."""
@@ -1680,6 +2050,75 @@ class AlertsTab(QWidget):
         self._devices_model.reset_data([])
         self._affected_label.setText("Affected Devices")
         self._show_in_devices_btn.setEnabled(False)
+        self._timeline_btn.setEnabled(False)
+
+        # Enable export only when there's something to export
+        self._export_btn.setEnabled(bool(rows))
+
+    def _export_csv(self):
+        """Export one row per (alert condition × affected device) pair."""
+        rows = self._groups_model._rows
+        if not rows:
+            return
+
+        default_name = (
+            f"meraki_alerts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        )
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Alerts Report", default_name,
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not path:
+            return
+
+        headers = [
+            "Severity", "Alert Type", "Category",
+            "Device Count", "Network Count",
+            "Device Name", "Serial", "Model", "Product Type",
+            "Device Status", "Network ID", "LAN IP",
+        ]
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(headers)
+                for group in rows:
+                    severity = str(group.get("severity", "") or "").capitalize()
+                    gtype = group.get("type", "") or ""
+                    cat = group.get("category", "") or ""
+                    dev_count = group.get("device_count", 0)
+                    net_count = group.get("network_count", 0)
+                    devices = group.get("devices", [])
+
+                    if not devices:
+                        writer.writerow([
+                            severity, gtype, cat,
+                            dev_count, net_count,
+                            "", "", "", "", "", "", "",
+                        ])
+                        continue
+
+                    for device in devices:
+                        writer.writerow([
+                            severity, gtype, cat,
+                            dev_count, net_count,
+                            device.get("name", ""),
+                            device.get("serial", ""),
+                            device.get("model", ""),
+                            device.get("productType", ""),
+                            str(device.get("status", "") or "").capitalize(),
+                            device.get("networkId", ""),
+                            device.get("lanIp", ""),
+                        ])
+        except OSError as exc:
+            QMessageBox.critical(self, "Export Failed", str(exc))
+            return
+
+        QToolTip.showText(
+            self._export_btn.mapToGlobal(self._export_btn.rect().bottomLeft()),
+            f"Exported to {Path(path).name}",
+            self._export_btn,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1737,6 +2176,9 @@ class MainWindow(QMainWindow):
         self._alerts_tab = AlertsTab()
         self._alerts_tab.show_in_devices_requested.connect(
             self._on_show_in_devices_requested
+        )
+        self._alerts_tab.show_timeline_requested.connect(
+            self._on_show_timeline_requested
         )
         self._tabs.addTab(self._alerts_tab, "Alerts")
 
@@ -1836,6 +2278,13 @@ class MainWindow(QMainWindow):
         self._health_btn = QPushButton("Health Details")
         self._health_btn.clicked.connect(self._show_health_details)
         h.addWidget(self._health_btn)
+
+        self._timeline_btn = QPushButton("Timeline…")
+        self._timeline_btn.setToolTip(
+            "Show alert history for the selected devices"
+        )
+        self._timeline_btn.clicked.connect(self._show_device_timeline)
+        h.addWidget(self._timeline_btn)
 
         self._columns_btn = QPushButton("Columns…")
         self._columns_btn.clicked.connect(self._show_column_chooser)
@@ -2072,6 +2521,18 @@ class MainWindow(QMainWindow):
         self._tabs.setCurrentIndex(0)  # switch to Devices tab
         self._update_count_label()
 
+    def _on_show_timeline_requested(self, devices: list):
+        """Called when the Alerts tab requests a timeline view."""
+        if not devices:
+            return
+        dialog = TimelineDialog(
+            self._api_key_input.text().strip(),
+            self._org_id_input.text().strip(),
+            devices,
+            self,
+        )
+        dialog.exec()
+
     def _clear_serial_filter(self):
         self._proxy_model.clear_serials_filter()
         self._filter_pill.setVisible(False)
@@ -2139,6 +2600,7 @@ class MainWindow(QMainWindow):
         self._fetch_btn.setEnabled(can_fetch)
         self._refresh_btn.setEnabled(can_fetch and self._has_data)
         self._health_btn.setEnabled(self._has_data)
+        self._timeline_btn.setEnabled(self._has_data)
         self._export_btn.setEnabled(self._has_data)
 
     # ---- Column Chooser ----
@@ -2213,6 +2675,45 @@ class MainWindow(QMainWindow):
             return
 
         dialog = HealthDialog(
+            self._api_key_input.text().strip(),
+            self._org_id_input.text().strip(),
+            devices,
+            self,
+        )
+        dialog.exec()
+
+    def _show_device_timeline(self):
+        """Show the alert timeline for selected (or all visible) devices."""
+        devices = self._get_selected_devices()
+        if not devices:
+            devices = []
+            for i in range(self._proxy_model.rowCount()):
+                source_idx = self._proxy_model.mapToSource(
+                    self._proxy_model.index(i, 0)
+                )
+                devices.append(self._table_model._rows[source_idx.row()])
+
+        if not devices:
+            QMessageBox.information(
+                self, "No Devices",
+                "No devices to check. Fetch devices first."
+            )
+            return
+
+        # Warn if a very large number of networks would be queried.
+        network_count = len({d.get("networkId", "") for d in devices if d.get("networkId")})
+        if network_count > 20:
+            reply = QMessageBox.question(
+                self,
+                "Large Query",
+                f"This will fetch alert history from {network_count} networks, "
+                "which may take a while and consume API quota. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        dialog = TimelineDialog(
             self._api_key_input.text().strip(),
             self._org_id_input.text().strip(),
             devices,
