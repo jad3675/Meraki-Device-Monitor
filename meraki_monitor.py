@@ -38,11 +38,13 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QSplitter,
     QStatusBar,
     QStyle,
     QStyleOptionViewItem,
     QStyledItemDelegate,
     QTableView,
+    QTabWidget,
     QToolTip,
     QVBoxLayout,
     QWidget,
@@ -71,6 +73,7 @@ BASE_COLUMNS: list[tuple[str, str]] = [
 # Extra columns that can be toggled on/off via the Columns dialog.
 # These fields come from the existing API responses at no extra cost.
 EXTRA_COLUMNS: list[tuple[str, str]] = [
+    ("alertCount", "Alerts"),
     ("address", "Location"),
     ("notes", "Notes"),
     ("tags", "Tags"),
@@ -107,6 +110,20 @@ STATUS_COLORS: dict[str, str] = {
     "alerting": "#FFC107",
     "offline": "#F44336",
     "dormant": "#9E9E9E",
+}
+
+SEVERITY_COLORS: dict[str, str] = {
+    "critical": "#F44336",
+    "warning": "#FFC107",
+    "informational": "#2196F3",
+    "info": "#2196F3",
+}
+
+SEVERITY_ORDER: dict[str, int] = {
+    "critical": 0,
+    "warning": 1,
+    "informational": 2,
+    "info": 2,
 }
 
 CADENCE_OPTIONS: list[tuple[str, int]] = [
@@ -555,18 +572,26 @@ class MerakiClient:
         self,
         stop_event: threading.Event,
         progress_cb=None,
-    ) -> list[dict]:
+    ) -> dict:
+        """Fetch devices, statuses, boot history, and health alerts.
+
+        Returns a dict:
+            {
+                "devices": [...],                # each device has "alerts": [...]
+                "alerts_by_network": {netId: [alerts]},
+            }
+        """
         if progress_cb:
             progress_cb("Fetching devices...")
         devices = self.fetch_devices(stop_event)
         if stop_event.is_set():
-            return []
+            return {"devices": [], "alerts_by_network": {}}
 
         if progress_cb:
             progress_cb(f"Found {len(devices)} devices. Fetching statuses...")
         statuses = self.fetch_statuses(stop_event)
         if stop_event.is_set():
-            return []
+            return {"devices": [], "alerts_by_network": {}}
 
         status_map = {s["serial"]: s for s in statuses}
         for device in devices:
@@ -588,24 +613,55 @@ class MerakiClient:
             progress_cb("Fetching boot history...")
         boots = self.fetch_boot_history(stop_event)
         if stop_event.is_set():
-            return []
+            return {"devices": [], "alerts_by_network": {}}
 
-        # Build serial -> most-recent-boot map
         boot_map: dict[str, str] = {}
         for entry in boots:
             serial = entry.get("serial", "")
             booted_at = (entry.get("start") or {}).get("bootedAt", "")
-            if serial and booted_at:
-                # Keep the most recent boot per serial (list is desc by default)
-                if serial not in boot_map:
-                    boot_map[serial] = booted_at
+            if serial and booted_at and serial not in boot_map:
+                boot_map[serial] = booted_at
         for device in devices:
             device["lastBootedAt"] = boot_map.get(device.get("serial", ""), "")
+
+        # Fetch health alerts per unique network
+        network_ids = list({d.get("networkId", "") for d in devices if d.get("networkId")})
+        alerts_by_network: dict[str, list[dict]] = {}
+        total_nets = len(network_ids)
+        for i, net_id in enumerate(network_ids):
+            if stop_event.is_set():
+                return {"devices": [], "alerts_by_network": {}}
+            if progress_cb:
+                progress_cb(f"Fetching alerts... ({i + 1}/{total_nets} networks)")
+            try:
+                alerts_by_network[net_id] = self.fetch_health_alerts(net_id, stop_event)
+            except MerakiAPIError:
+                alerts_by_network[net_id] = []
+
+        # Attach matching alerts to each device
+        for device in devices:
+            net_id = device.get("networkId", "")
+            serial = device.get("serial", "")
+            mac = device.get("mac", "")
+            net_alerts = alerts_by_network.get(net_id, [])
+            matched: list[dict] = []
+            for alert in net_alerts:
+                scope = alert.get("scope", {}) or {}
+                scope_devices = scope.get("devices", []) or []
+                if not scope_devices:
+                    matched.append(alert)
+                    continue
+                for sd in scope_devices:
+                    if sd.get("serial") == serial or (mac and sd.get("mac") == mac):
+                        matched.append(alert)
+                        break
+            device["alerts"] = matched
+            device["alertCount"] = len(matched)
 
         if progress_cb:
             progress_cb(f"Loaded {len(devices)} devices.")
 
-        return devices
+        return {"devices": devices, "alerts_by_network": alerts_by_network}
 
 
 # ---------------------------------------------------------------------------
@@ -616,7 +672,7 @@ class MerakiClient:
 class FetchWorker(QThread):
     """Fetches Meraki device data on a background thread."""
 
-    data_ready = pyqtSignal(list)
+    data_ready = pyqtSignal(dict)
     error = pyqtSignal(str, int)
     progress = pyqtSignal(str)
 
@@ -632,9 +688,9 @@ class FetchWorker(QThread):
     def run(self):
         try:
             client = MerakiClient(self._api_key, self._org_id)
-            rows = client.fetch_all(self._stop, self.progress.emit)
+            payload = client.fetch_all(self._stop, self.progress.emit)
             if not self._stop.is_set():
-                self.data_ready.emit(rows)
+                self.data_ready.emit(payload)
         except MerakiAPIError as exc:
             if not self._stop.is_set():
                 self.error.emit(str(exc), exc.status_code or -1)
@@ -767,6 +823,8 @@ class DeviceTableModel(QAbstractTableModel):
                 return _format_timestamp(raw)
             if key == "status":
                 return str(raw or "").capitalize()
+            if key == "alertCount":
+                return str(raw) if raw else "0"
             return str(raw) if raw else ""
 
         if role == Qt.ItemDataRole.UserRole:
@@ -775,10 +833,24 @@ class DeviceTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.UserRole + 1:
             if key in ("lastReportedAt", "lastBootedAt"):
                 return str(raw or "")
+            if key == "alertCount":
+                return int(raw or 0)
             return str(raw or "").lower()
 
+        if role == Qt.ItemDataRole.ForegroundRole and key == "alertCount":
+            count = int(raw or 0)
+            if count > 0:
+                return QColor("#FFC107")
+
+        if role == Qt.ItemDataRole.FontRole and key == "alertCount":
+            count = int(raw or 0)
+            if count > 0:
+                f = QFont()
+                f.setBold(True)
+                return f
+
         if role == Qt.ItemDataRole.TextAlignmentRole:
-            if key in ("status", "lanIp", "publicIp"):
+            if key in ("status", "lanIp", "publicIp", "alertCount"):
                 return Qt.AlignmentFlag.AlignCenter
             return Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
 
@@ -797,6 +869,8 @@ class DeviceProxyModel(QSortFilterProxyModel):
         super().__init__(parent)
         self._type_filter: str = ""
         self._text_filter: str = ""
+        self._alerts_only: bool = False
+        self._serials_filter: set[str] = set()
 
     def set_type_filter(self, product_type: str):
         self._type_filter = product_type
@@ -806,12 +880,32 @@ class DeviceProxyModel(QSortFilterProxyModel):
         self._text_filter = text.lower().strip()
         self.invalidateFilter()
 
+    def set_alerts_only(self, enabled: bool):
+        self._alerts_only = enabled
+        self.invalidateFilter()
+
+    def set_serials_filter(self, serials: set[str] | None):
+        self._serials_filter = set(serials) if serials else set()
+        self.invalidateFilter()
+
+    def clear_serials_filter(self):
+        self._serials_filter = set()
+        self.invalidateFilter()
+
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
         model = self.sourceModel()
         row_dict = model._rows[source_row]
 
+        if self._serials_filter:
+            if row_dict.get("serial", "") not in self._serials_filter:
+                return False
+
         if self._type_filter:
             if row_dict.get("productType", "") != self._type_filter:
+                return False
+
+        if self._alerts_only:
+            if not row_dict.get("alerts"):
                 return False
 
         if self._text_filter:
@@ -1164,6 +1258,431 @@ class ColumnChooserDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
+# Alerts Tab
+# ---------------------------------------------------------------------------
+
+
+ALERT_GROUP_COLUMNS: list[tuple[str, str]] = [
+    ("severity", "Severity"),
+    ("type", "Alert Type"),
+    ("category", "Category"),
+    ("device_count", "Devices"),
+    ("network_count", "Networks"),
+]
+
+AFFECTED_DEVICE_COLUMNS: list[tuple[str, str]] = [
+    ("name", "Name"),
+    ("serial", "Serial"),
+    ("model", "Model"),
+    ("productType", "Product Type"),
+    ("status", "Status"),
+    ("networkId", "Network ID"),
+    ("lanIp", "LAN IP"),
+]
+
+
+def _alert_key(alert: dict) -> tuple[str, str, str]:
+    """Group alerts by (severity, type, category)."""
+    return (
+        (alert.get("severity") or "").lower(),
+        alert.get("type") or "Unknown",
+        alert.get("category") or "",
+    )
+
+
+class AlertGroupsModel(QAbstractTableModel):
+    """Lists distinct alert conditions across the org, with per-alert counts."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Each row: {severity, type, category, device_count, network_count, devices: [dict]}
+        self._rows: list[dict] = []
+
+    def reset_data(self, rows: list[dict]):
+        self.beginResetModel()
+        self._rows = rows
+        self.endResetModel()
+
+    def group_at(self, row: int) -> dict | None:
+        if 0 <= row < len(self._rows):
+            return self._rows[row]
+        return None
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self._rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(ALERT_GROUP_COLUMNS)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            return ALERT_GROUP_COLUMNS[section][1]
+        return None
+
+    def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+
+        row = self._rows[index.row()]
+        key = ALERT_GROUP_COLUMNS[index.column()][0]
+
+        if role == Qt.ItemDataRole.DisplayRole:
+            if key == "severity":
+                return str(row.get("severity", "") or "").capitalize() or "—"
+            if key == "device_count":
+                return str(row.get("device_count", 0))
+            if key == "network_count":
+                return str(row.get("network_count", 0))
+            return str(row.get(key, "") or "")
+
+        if role == Qt.ItemDataRole.UserRole + 1:
+            # Sort role: severity sorts by SEVERITY_ORDER, counts sort numeric
+            if key == "severity":
+                return SEVERITY_ORDER.get(row.get("severity", ""), 99)
+            if key in ("device_count", "network_count"):
+                return row.get(key, 0)
+            return str(row.get(key, "") or "").lower()
+
+        if role == Qt.ItemDataRole.ForegroundRole and key == "severity":
+            color_hex = SEVERITY_COLORS.get(row.get("severity", ""), None)
+            if color_hex:
+                return QColor(color_hex)
+
+        if role == Qt.ItemDataRole.FontRole and key == "severity":
+            f = QFont()
+            f.setBold(True)
+            return f
+
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            if key in ("device_count", "network_count"):
+                return Qt.AlignmentFlag.AlignCenter
+            return Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+
+        return None
+
+
+class AlertGroupsProxyModel(QSortFilterProxyModel):
+    """Sorts alert groups; supports text search across all columns."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._text_filter: str = ""
+        self._severity_filter: str = ""
+
+    def set_text_filter(self, text: str):
+        self._text_filter = text.lower().strip()
+        self.invalidateFilter()
+
+    def set_severity_filter(self, severity: str):
+        self._severity_filter = severity.lower().strip()
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
+        model: AlertGroupsModel = self.sourceModel()
+        row = model._rows[source_row]
+
+        if self._severity_filter and row.get("severity", "") != self._severity_filter:
+            return False
+
+        if self._text_filter:
+            blob = " ".join(
+                str(row.get(k, "") or "")
+                for k in ("severity", "type", "category")
+            ).lower()
+            if self._text_filter not in blob:
+                return False
+        return True
+
+    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
+        sort_role = Qt.ItemDataRole.UserRole + 1
+        lv = left.data(sort_role)
+        rv = right.data(sort_role)
+        if lv is None:
+            lv = ""
+        if rv is None:
+            rv = ""
+        try:
+            return lv < rv
+        except TypeError:
+            return str(lv) < str(rv)
+
+
+class AffectedDevicesModel(QAbstractTableModel):
+    """Lists the devices affected by a selected alert group."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rows: list[dict] = []
+
+    def reset_data(self, rows: list[dict]):
+        self.beginResetModel()
+        self._rows = rows
+        self.endResetModel()
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self._rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(AFFECTED_DEVICE_COLUMNS)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            return AFFECTED_DEVICE_COLUMNS[section][1]
+        return None
+
+    def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        row = self._rows[index.row()]
+        key = AFFECTED_DEVICE_COLUMNS[index.column()][0]
+
+        if role == Qt.ItemDataRole.DisplayRole:
+            if key == "status":
+                return str(row.get("status", "") or "").capitalize()
+            return str(row.get(key, "") or "")
+
+        if role == Qt.ItemDataRole.UserRole:
+            if key == "status":
+                return str(row.get("status", "") or "").lower()
+            return str(row.get(key, "") or "").lower()
+
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            if key == "status":
+                return Qt.AlignmentFlag.AlignCenter
+            return Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+
+        return None
+
+
+class AlertsTab(QWidget):
+    """Tab showing active alert conditions and affected devices."""
+
+    # Emitted when the user asks to jump to the Devices tab filtered by a group
+    show_in_devices_requested = pyqtSignal(list)  # list of serials
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._groups_model = AlertGroupsModel(self)
+        self._groups_proxy = AlertGroupsProxyModel(self)
+        self._groups_proxy.setSourceModel(self._groups_model)
+        self._devices_model = AffectedDevicesModel(self)
+
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        # Top filter row
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(8)
+
+        filter_row.addWidget(QLabel("Severity:"))
+        self._severity_combo = QComboBox()
+        self._severity_combo.addItem("All", "")
+        self._severity_combo.addItem("Critical", "critical")
+        self._severity_combo.addItem("Warning", "warning")
+        self._severity_combo.addItem("Informational", "informational")
+        self._severity_combo.currentIndexChanged.connect(self._on_severity_changed)
+        filter_row.addWidget(self._severity_combo)
+
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search alert type or category...")
+        self._search.setMinimumWidth(220)
+        self._search.textChanged.connect(self._groups_proxy.set_text_filter)
+        filter_row.addWidget(self._search)
+
+        filter_row.addStretch()
+
+        self._summary_label = QLabel("No alerts loaded.")
+        self._summary_label.setStyleSheet("color: #9e9e9e;")
+        filter_row.addWidget(self._summary_label)
+
+        layout.addLayout(filter_row)
+
+        # Splitter: alerts list | affected devices
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left: groups table
+        left = QWidget()
+        left_lo = QVBoxLayout(left)
+        left_lo.setContentsMargins(0, 0, 0, 0)
+        left_lo.setSpacing(4)
+        left_lo.addWidget(QLabel("Alert Conditions"))
+
+        self._groups_view = QTableView()
+        self._groups_view.setModel(self._groups_proxy)
+        self._groups_view.setSortingEnabled(True)
+        self._groups_view.setAlternatingRowColors(True)
+        self._groups_view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._groups_view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._groups_view.verticalHeader().setVisible(False)
+        self._groups_view.setShowGrid(False)
+        self._groups_view.horizontalHeader().setStretchLastSection(True)
+        self._groups_view.horizontalHeader().setHighlightSections(False)
+        self._groups_view.selectionModel().selectionChanged.connect(
+            self._on_group_selected
+        )
+        self._groups_view.doubleClicked.connect(self._on_group_double_clicked)
+
+        header = self._groups_view.horizontalHeader()
+        for i, w in enumerate([90, 240, 160, 80, 80]):
+            header.resizeSection(i, w)
+
+        left_lo.addWidget(self._groups_view, stretch=1)
+
+        # Right: affected devices
+        right = QWidget()
+        right_lo = QVBoxLayout(right)
+        right_lo.setContentsMargins(0, 0, 0, 0)
+        right_lo.setSpacing(4)
+
+        self._affected_label = QLabel("Affected Devices")
+        right_lo.addWidget(self._affected_label)
+
+        self._devices_view = QTableView()
+        self._devices_view.setModel(self._devices_model)
+        self._devices_view.setAlternatingRowColors(True)
+        self._devices_view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._devices_view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._devices_view.verticalHeader().setVisible(False)
+        self._devices_view.setShowGrid(False)
+        self._devices_view.horizontalHeader().setStretchLastSection(True)
+        self._devices_view.horizontalHeader().setHighlightSections(False)
+        # Status is column 4 in AFFECTED_DEVICE_COLUMNS
+        status_col = next(
+            (i for i, (k, _) in enumerate(AFFECTED_DEVICE_COLUMNS) if k == "status"), -1
+        )
+        if status_col >= 0:
+            self._devices_view.setItemDelegateForColumn(status_col, StatusDelegate(self))
+
+        header = self._devices_view.horizontalHeader()
+        for i, w in enumerate([200, 140, 110, 110, 100, 200, 110]):
+            header.resizeSection(i, w)
+
+        right_lo.addWidget(self._devices_view, stretch=1)
+
+        # Jump-to-devices button
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self._show_in_devices_btn = QPushButton("Show in Devices Tab →")
+        self._show_in_devices_btn.setEnabled(False)
+        self._show_in_devices_btn.clicked.connect(self._emit_show_in_devices)
+        btn_row.addWidget(self._show_in_devices_btn)
+        right_lo.addLayout(btn_row)
+
+        splitter.addWidget(left)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 4)
+        splitter.setSizes([500, 700])
+
+        layout.addWidget(splitter, stretch=1)
+
+    def _on_severity_changed(self, idx: int):
+        value = self._severity_combo.itemData(idx) or ""
+        self._groups_proxy.set_severity_filter(value)
+
+    def _on_group_selected(self, *_):
+        group = self._current_group()
+        if not group:
+            self._devices_model.reset_data([])
+            self._affected_label.setText("Affected Devices")
+            self._show_in_devices_btn.setEnabled(False)
+            return
+
+        devices = group.get("devices", [])
+        self._devices_model.reset_data(devices)
+        label = group.get("type") or group.get("category") or "Alert"
+        self._affected_label.setText(
+            f"Affected Devices — {label} ({len(devices)})"
+        )
+        self._show_in_devices_btn.setEnabled(bool(devices))
+
+    def _on_group_double_clicked(self, _index: QModelIndex):
+        self._emit_show_in_devices()
+
+    def _current_group(self) -> dict | None:
+        sel = self._groups_view.selectionModel().selectedRows()
+        if not sel:
+            return None
+        source_idx = self._groups_proxy.mapToSource(sel[0])
+        return self._groups_model.group_at(source_idx.row())
+
+    def _emit_show_in_devices(self):
+        group = self._current_group()
+        if not group:
+            return
+        serials = [d.get("serial", "") for d in group.get("devices", []) if d.get("serial")]
+        if serials:
+            self.show_in_devices_requested.emit(serials)
+
+    def update_data(self, devices: list[dict]):
+        """Rebuild the alert groups from the device list."""
+        groups: dict[tuple, dict] = {}
+        for device in devices:
+            for alert in device.get("alerts", []) or []:
+                key = _alert_key(alert)
+                sev, atype, cat = key
+                g = groups.setdefault(key, {
+                    "severity": sev,
+                    "type": atype,
+                    "category": cat,
+                    "devices": [],
+                    "_serials": set(),
+                    "_networks": set(),
+                })
+                serial = device.get("serial", "")
+                if serial and serial not in g["_serials"]:
+                    g["_serials"].add(serial)
+                    g["devices"].append(device)
+                net = device.get("networkId", "")
+                if net:
+                    g["_networks"].add(net)
+
+        rows = []
+        for g in groups.values():
+            rows.append({
+                "severity": g["severity"],
+                "type": g["type"],
+                "category": g["category"],
+                "device_count": len(g["devices"]),
+                "network_count": len(g["_networks"]),
+                "devices": g["devices"],
+            })
+
+        # Sort by severity first, then device count desc
+        rows.sort(key=lambda r: (
+            SEVERITY_ORDER.get(r["severity"], 99),
+            -r["device_count"],
+        ))
+
+        self._groups_model.reset_data(rows)
+
+        # Update summary label
+        total_alerts = sum(len(d.get("alerts", [])) for d in devices)
+        unique = len(rows)
+        if total_alerts == 0:
+            self._summary_label.setText("No active alerts.")
+            self._summary_label.setStyleSheet("color: #4CAF50;")
+        else:
+            crit = sum(1 for r in rows if r["severity"] == "critical")
+            warn = sum(1 for r in rows if r["severity"] == "warning")
+            self._summary_label.setText(
+                f"{unique} alert conditions, {total_alerts} alerts "
+                f"(crit: {crit}, warn: {warn})"
+            )
+            color = "#F44336" if crit else "#FFC107" if warn else "#2196F3"
+            self._summary_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+
+        # Clear right pane
+        self._devices_model.reset_data([])
+        self._affected_label.setText("Affected Devices")
+        self._show_in_devices_btn.setEnabled(False)
+
+
+# ---------------------------------------------------------------------------
 # Main Window
 # ---------------------------------------------------------------------------
 
@@ -1203,8 +1722,25 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 12, 12, 4)
 
         layout.addWidget(self._build_connection_panel())
-        layout.addWidget(self._build_controls_bar())
-        layout.addWidget(self._build_table(), stretch=1)
+
+        # Tabs: Devices | Alerts
+        self._tabs = QTabWidget()
+
+        devices_tab = QWidget()
+        dv_lo = QVBoxLayout(devices_tab)
+        dv_lo.setContentsMargins(0, 6, 0, 0)
+        dv_lo.setSpacing(8)
+        dv_lo.addWidget(self._build_controls_bar())
+        dv_lo.addWidget(self._build_table(), stretch=1)
+        self._tabs.addTab(devices_tab, "Devices")
+
+        self._alerts_tab = AlertsTab()
+        self._alerts_tab.show_in_devices_requested.connect(
+            self._on_show_in_devices_requested
+        )
+        self._tabs.addTab(self._alerts_tab, "Alerts")
+
+        layout.addWidget(self._tabs, stretch=1)
         self._build_status_bar()
 
     def _build_connection_panel(self) -> QFrame:
@@ -1288,6 +1824,10 @@ class MainWindow(QMainWindow):
         self._search_input.textChanged.connect(self._on_text_filter_changed)
         h.addWidget(self._search_input)
 
+        self._alerts_only_cb = QCheckBox("Only with alerts")
+        self._alerts_only_cb.toggled.connect(self._on_alerts_only_toggled)
+        h.addWidget(self._alerts_only_cb)
+
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.VLine)
         sep2.setStyleSheet("color: #555555;")
@@ -1350,6 +1890,22 @@ class MainWindow(QMainWindow):
         self._status_label = QLabel("Ready")
         self._status_label.setMinimumWidth(300)
         sb.addWidget(self._status_label, stretch=1)
+
+        # "Filtered by alert" pill — shown only when a serial filter is active
+        self._filter_pill = QPushButton("")
+        self._filter_pill.setVisible(False)
+        self._filter_pill.setFlat(True)
+        self._filter_pill.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._filter_pill.setStyleSheet(
+            "QPushButton { background-color: #FFC107; color: #000000; "
+            "padding: 2px 8px; border-radius: 8px; font-weight: bold; } "
+            "QPushButton:hover { background-color: #FFD54F; }"
+        )
+        self._filter_pill.clicked.connect(self._clear_serial_filter)
+        sb.addPermanentWidget(self._filter_pill)
+
+        self._alert_count_label = QLabel("")
+        sb.addPermanentWidget(self._alert_count_label)
 
         self._count_label = QLabel("")
         sb.addPermanentWidget(self._count_label)
@@ -1430,14 +1986,27 @@ class MainWindow(QMainWindow):
             return
         self._start_fetch()
 
-    def _on_data_ready(self, rows: list[dict]):
-        self._table_model.reset_data(rows)
+    def _on_data_ready(self, payload: dict):
+        devices = payload.get("devices", []) if isinstance(payload, dict) else []
+        self._table_model.reset_data(devices)
         self._has_data = True
         self._update_count_label()
+        self._update_alert_count_label(devices)
+
+        # Push alerts to the Alerts tab
+        self._alerts_tab.update_data(devices)
+
+        # Update the Alerts tab badge
+        total_alerts = sum(len(d.get("alerts", [])) for d in devices)
+        if total_alerts:
+            self._tabs.setTabText(1, f"Alerts ({total_alerts})")
+        else:
+            self._tabs.setTabText(1, "Alerts")
+
         now = datetime.now().strftime("%H:%M:%S")
         self._updated_label.setText(f"Updated: {now}")
         self._status_label.setStyleSheet("")
-        self._status_label.setText(f"Loaded {len(rows)} devices.")
+        self._status_label.setText(f"Loaded {len(devices)} devices.")
 
     def _on_fetch_error(self, message: str, status_code: int):
         self._status_label.setText(f"Error: {message}")
@@ -1463,14 +2032,20 @@ class MainWindow(QMainWindow):
         self._auto_refresh_cb.setChecked(False)
         self._refresh_timer.stop()
         self._table_model.reset_data([])
+        self._alerts_tab.update_data([])
+        self._tabs.setTabText(1, "Alerts")
         self._has_data = False
         self._api_key_input.clear()
         self._org_id_input.clear()
         self._type_combo.setCurrentIndex(0)
         self._search_input.clear()
+        self._alerts_only_cb.setChecked(False)
+        self._proxy_model.clear_serials_filter()
+        self._filter_pill.setVisible(False)
         self._status_label.setText("Ready")
         self._status_label.setStyleSheet("")
         self._count_label.setText("")
+        self._alert_count_label.setText("")
         self._updated_label.setText("")
         self._update_controls_state()
 
@@ -1481,6 +2056,25 @@ class MainWindow(QMainWindow):
 
     def _on_text_filter_changed(self, text: str):
         self._proxy_model.set_text_filter(text)
+        self._update_count_label()
+
+    def _on_alerts_only_toggled(self, checked: bool):
+        self._proxy_model.set_alerts_only(checked)
+        self._update_count_label()
+
+    def _on_show_in_devices_requested(self, serials: list):
+        """Called when the Alerts tab asks to jump to devices filtered by serial."""
+        if not serials:
+            return
+        self._proxy_model.set_serials_filter(set(serials))
+        self._filter_pill.setText(f"✕  Filtered by alert ({len(serials)} devices)")
+        self._filter_pill.setVisible(True)
+        self._tabs.setCurrentIndex(0)  # switch to Devices tab
+        self._update_count_label()
+
+    def _clear_serial_filter(self):
+        self._proxy_model.clear_serials_filter()
+        self._filter_pill.setVisible(False)
         self._update_count_label()
 
     def _on_auto_refresh_toggled(self, checked: bool):
@@ -1506,6 +2100,39 @@ class MainWindow(QMainWindow):
             self._count_label.setText(f"{total} devices")
         else:
             self._count_label.setText(f"{visible} / {total} devices")
+
+    def _update_alert_count_label(self, devices: list[dict]):
+        """Compose a colored alerts summary for the status bar."""
+        if not devices:
+            self._alert_count_label.setText("")
+            return
+
+        total_alerts = sum(len(d.get("alerts", [])) for d in devices)
+        offline = sum(1 for d in devices if d.get("status", "").lower() == "offline")
+        alerting = sum(1 for d in devices if d.get("status", "").lower() == "alerting")
+
+        if total_alerts == 0 and offline == 0 and alerting == 0:
+            self._alert_count_label.setText(
+                "<span style='color:#4CAF50; font-weight:bold;'>✓ All healthy</span>"
+            )
+            return
+
+        parts = []
+        if total_alerts:
+            parts.append(
+                f"<span style='color:#FFC107; font-weight:bold;'>"
+                f"⚠ {total_alerts} alert{'s' if total_alerts != 1 else ''}</span>"
+            )
+        if offline:
+            parts.append(
+                f"<span style='color:#F44336; font-weight:bold;'>"
+                f"● {offline} offline</span>"
+            )
+        if alerting:
+            parts.append(
+                f"<span style='color:#FFC107;'>● {alerting} alerting</span>"
+            )
+        self._alert_count_label.setText(" &nbsp;|&nbsp; ".join(parts))
 
     def _update_controls_state(self):
         can_fetch = not self._is_fetching
