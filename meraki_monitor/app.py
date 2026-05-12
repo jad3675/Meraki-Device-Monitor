@@ -191,6 +191,13 @@ class MainWindow(QMainWindow):
         self._alerts_only_cb.toggled.connect(self._on_alerts_only_toggled)
         h.addWidget(self._alerts_only_cb)
 
+        self._clear_filters_btn = QPushButton("Clear Filters")
+        self._clear_filters_btn.setObjectName("clear_btn")
+        self._clear_filters_btn.setToolTip("Reset all active filters")
+        self._clear_filters_btn.clicked.connect(self._clear_all_filters)
+        self._clear_filters_btn.setVisible(False)
+        h.addWidget(self._clear_filters_btn)
+
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.VLine)
         sep2.setStyleSheet("color: #555555;")
@@ -410,14 +417,17 @@ class MainWindow(QMainWindow):
         type_str = "" if index == 0 else PRODUCT_TYPES[index - 1]
         self._proxy_model.set_type_filter(type_str)
         self._update_count_label()
+        self._update_clear_filters_visibility()
 
     def _on_text_filter_changed(self, text: str):
         self._proxy_model.set_text_filter(text)
         self._update_count_label()
+        self._update_clear_filters_visibility()
 
     def _on_alerts_only_toggled(self, checked: bool):
         self._proxy_model.set_alerts_only(checked)
         self._update_count_label()
+        self._update_clear_filters_visibility()
 
     def _on_show_in_devices_requested(self, serials: list):
         if not serials:
@@ -427,6 +437,7 @@ class MainWindow(QMainWindow):
         self._filter_pill.setVisible(True)
         self._tabs.setCurrentIndex(0)
         self._update_count_label()
+        self._update_clear_filters_visibility()
 
     def _on_show_timeline_requested(self, payload: dict):
         """Called when the Alerts tab requests a timeline view."""
@@ -447,6 +458,27 @@ class MainWindow(QMainWindow):
         self._proxy_model.clear_serials_filter()
         self._filter_pill.setVisible(False)
         self._update_count_label()
+        self._update_clear_filters_visibility()
+
+    def _clear_all_filters(self):
+        """Reset all device-tab filters in one click."""
+        self._type_combo.setCurrentIndex(0)
+        self._search_input.clear()
+        self._alerts_only_cb.setChecked(False)
+        self._proxy_model.clear_serials_filter()
+        self._filter_pill.setVisible(False)
+        self._update_count_label()
+        self._update_clear_filters_visibility()
+
+    def _update_clear_filters_visibility(self):
+        """Show the Clear Filters button only when at least one filter is active."""
+        has_filter = (
+            self._type_combo.currentIndex() != 0
+            or bool(self._search_input.text().strip())
+            or self._alerts_only_cb.isChecked()
+            or bool(self._proxy_model._serials_filter)
+        )
+        self._clear_filters_btn.setVisible(has_filter)
 
     def _on_auto_refresh_toggled(self, checked: bool):
         if checked and self._has_data:
