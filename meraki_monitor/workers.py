@@ -116,7 +116,7 @@ class HealthAlertWorker(QThread):
 
 
 class TimelineWorker(QThread):
-    """Fetches alert history for given networks and filters by device serials."""
+    """Fetches alert history for given networks and filters by device serials and alert types."""
 
     data_ready = pyqtSignal(list)
     error = pyqtSignal(str)
@@ -128,6 +128,7 @@ class TimelineWorker(QThread):
         org_id: str,
         network_ids: list[str],
         serials: set[str] | None,
+        alert_type_ids: set[str] | None = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -135,6 +136,7 @@ class TimelineWorker(QThread):
         self._org_id = org_id
         self._network_ids = list(dict.fromkeys(network_ids))
         self._serials = set(serials) if serials else None
+        self._alert_type_ids = set(alert_type_ids) if alert_type_ids else None
         self._stop = threading.Event()
 
     def cancel(self):
@@ -157,13 +159,20 @@ class TimelineWorker(QThread):
 
                 for entry in history:
                     serial = (entry.get("device") or {}).get("serial", "")
+                    # Filter by serial if specified
                     if self._serials and serial not in self._serials:
                         continue
+                    # Filter by alert type if specified
+                    alert_type = entry.get("alertType", "") or ""
+                    alert_type_id = entry.get("alertTypeId", "") or ""
+                    if self._alert_type_ids:
+                        if (alert_type not in self._alert_type_ids
+                                and alert_type_id not in self._alert_type_ids):
+                            continue
                     entries.append({
                         "occurredAt": entry.get("occurredAt", ""),
-                        "alertType": entry.get("alertType", "")
-                            or entry.get("alertTypeId", ""),
-                        "alertTypeId": entry.get("alertTypeId", ""),
+                        "alertType": alert_type or alert_type_id,
+                        "alertTypeId": alert_type_id,
                         "serial": serial,
                         "networkId": net_id,
                         "alertData": entry.get("alertData", {}) or {},

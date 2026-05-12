@@ -428,14 +428,18 @@ class MainWindow(QMainWindow):
         self._tabs.setCurrentIndex(0)
         self._update_count_label()
 
-    def _on_show_timeline_requested(self, devices: list):
+    def _on_show_timeline_requested(self, payload: dict):
+        """Called when the Alerts tab requests a timeline view."""
+        devices = payload.get("devices", [])
+        alert_type_ids = payload.get("alert_type_ids") or None
         if not devices:
             return
         dialog = TimelineDialog(
             self._api_key_input.text().strip(),
             self._org_id_input.text().strip(),
             devices,
-            self,
+            alert_type_ids=alert_type_ids,
+            parent=self,
         )
         dialog.exec()
 

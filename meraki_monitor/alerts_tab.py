@@ -235,7 +235,7 @@ class AlertsTab(QWidget):
     """Tab showing active alert conditions and affected devices."""
 
     show_in_devices_requested = pyqtSignal(list)  # list of serials
-    show_timeline_requested = pyqtSignal(list)  # list of device dicts
+    show_timeline_requested = pyqtSignal(dict)  # {"devices": [...], "alert_type_ids": set}
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -298,7 +298,7 @@ class AlertsTab(QWidget):
         self._groups_view.setSortingEnabled(True)
         self._groups_view.setAlternatingRowColors(True)
         self._groups_view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._groups_view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._groups_view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._groups_view.verticalHeader().setVisible(False)
         self._groups_view.setShowGrid(False)
         self._groups_view.horizontalHeader().setStretchLastSection(True)
@@ -375,50 +375,101 @@ class AlertsTab(QWidget):
         self._groups_proxy.set_severity_filter(value)
 
     def _on_group_selected(self, *_):
-        group = self._current_group()
-        if not group:
+        groups = self._selected_groups()
+        if not groups:
             self._devices_model.reset_data([])
             self._affected_label.setText("Affected Devices")
             self._show_in_devices_btn.setEnabled(False)
             self._timeline_btn.setEnabled(False)
             return
 
-        devices = group.get("devices", [])
+        # Aggregate devices from all selected groups (dedupe by serial)
+        seen_serials: set[str] = set()
+        devices: list[dict] = []
+        for group in groups:
+            for d in group.get("devices", []):
+                serial = d.get("serial", "")
+                if serial and serial not in seen_serials:
+                    seen_serials.add(serial)
+                    devices.append(d)
+
         self._devices_model.reset_data(devices)
-        label = group.get("type") or group.get("category") or "Alert"
-        self._affected_label.setText(
-            f"Affected Devices \u2014 {label} ({len(devices)})"
-        )
+
+        if len(groups) == 1:
+            label = groups[0].get("type") or groups[0].get("category") or "Alert"
+            self._affected_label.setText(
+                f"Affected Devices \u2014 {label} ({len(devices)})"
+            )
+        else:
+            self._affected_label.setText(
+                f"Affected Devices \u2014 {len(groups)} alert types ({len(devices)} devices)"
+            )
         self._show_in_devices_btn.setEnabled(bool(devices))
         self._timeline_btn.setEnabled(bool(devices))
 
     def _on_group_double_clicked(self, _index: QModelIndex):
         self._emit_show_in_devices()
 
-    def _current_group(self) -> dict | None:
+    def _selected_groups(self) -> list[dict]:
+        """Return all currently selected alert group dicts."""
         sel = self._groups_view.selectionModel().selectedRows()
         if not sel:
-            return None
-        source_idx = self._groups_proxy.mapToSource(sel[0])
-        return self._groups_model.group_at(source_idx.row())
+            return []
+        groups = []
+        for proxy_idx in sel:
+            source_idx = self._groups_proxy.mapToSource(proxy_idx)
+            g = self._groups_model.group_at(source_idx.row())
+            if g:
+                groups.append(g)
+        return groups
 
     def _emit_show_in_devices(self):
-        group = self._current_group()
-        if not group:
+        groups = self._selected_groups()
+        if not groups:
             return
-        serials = [d.get("serial", "") for d in group.get("devices", []) if d.get("serial")]
+        serials = []
+        seen: set[str] = set()
+        for group in groups:
+            for d in group.get("devices", []):
+                s = d.get("serial", "")
+                if s and s not in seen:
+                    seen.add(s)
+                    serials.append(s)
         if serials:
             self.show_in_devices_requested.emit(serials)
 
     def _show_timeline(self):
+        groups = self._selected_groups()
+        if not groups:
+            return
+
+        # Collect alert type IDs from the selected groups
+        alert_type_ids: set[str] = set()
+        for group in groups:
+            atype = group.get("type", "")
+            if atype:
+                alert_type_ids.add(atype)
+
+        # Use selected rows from the affected-devices table if any; otherwise
+        # fall back to all devices across selected groups.
         sel = self._devices_view.selectionModel().selectedRows()
         if sel:
-            rows = [self._devices_model._rows[i.row()] for i in sel]
+            devices = [self._devices_model._rows[i.row()] for i in sel]
         else:
-            group = self._current_group()
-            rows = group.get("devices", []) if group else []
-        if rows:
-            self.show_timeline_requested.emit(rows)
+            seen_serials: set[str] = set()
+            devices: list[dict] = []
+            for group in groups:
+                for d in group.get("devices", []):
+                    serial = d.get("serial", "")
+                    if serial and serial not in seen_serials:
+                        seen_serials.add(serial)
+                        devices.append(d)
+
+        if devices:
+            self.show_timeline_requested.emit({
+                "devices": devices,
+                "alert_type_ids": alert_type_ids,
+            })
 
     # ---- Public ----
 

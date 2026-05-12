@@ -80,17 +80,31 @@ class TimelineTableModel(QAbstractTableModel):
 class TimelineDialog(QDialog):
     """Shows alert history for the selected devices."""
 
-    def __init__(self, api_key: str, org_id: str, devices: list[dict], parent=None):
+    def __init__(
+        self,
+        api_key: str,
+        org_id: str,
+        devices: list[dict],
+        alert_type_ids: set[str] | None = None,
+        parent=None,
+    ):
         super().__init__(parent)
         self._api_key = api_key
         self._org_id = org_id
         self._devices = devices
+        self._alert_type_ids = set(alert_type_ids) if alert_type_ids else None
         self._serial_to_name = {
             d.get("serial", ""): d.get("name", "") for d in devices if d.get("serial")
         }
         self._worker: TimelineWorker | None = None
 
-        self.setWindowTitle(f"Alert Timeline \u2014 {len(devices)} device(s)")
+        title = f"Alert Timeline \u2014 {len(devices)} device(s)"
+        if self._alert_type_ids:
+            types_str = ", ".join(sorted(self._alert_type_ids)[:3])
+            if len(self._alert_type_ids) > 3:
+                types_str += f" (+{len(self._alert_type_ids) - 3} more)"
+            title += f" \u2014 {types_str}"
+        self.setWindowTitle(title)
         self.resize(1050, 550)
         self.setMinimumSize(700, 360)
 
@@ -149,7 +163,8 @@ class TimelineDialog(QDialog):
             return
 
         self._worker = TimelineWorker(
-            self._api_key, self._org_id, network_ids, serials, self
+            self._api_key, self._org_id, network_ids, serials,
+            alert_type_ids=self._alert_type_ids, parent=self
         )
         self._worker.data_ready.connect(self._on_data_ready)
         self._worker.error.connect(self._on_error)
