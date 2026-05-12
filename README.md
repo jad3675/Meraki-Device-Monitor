@@ -45,7 +45,13 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-python meraki_monitor.py
+python run.py
+```
+
+Or using the package directly:
+
+```bash
+python -m meraki_monitor
 ```
 
 1. Enter your **API Key** and **Org ID** in the connection panel at the top.
@@ -70,8 +76,23 @@ All requests include automatic pagination and rate-limit retry (respects `Retry-
 ## Project Structure
 
 ```
-├── meraki_monitor.py   # Single-file application (GUI + API client)
-├── requirements.txt    # Python dependencies
+├── meraki_monitor/            # Application package
+│   ├── __init__.py            # Package entry point, exports main()
+│   ├── __main__.py            # Enables `python -m meraki_monitor`
+│   ├── constants.py           # Column defs, colors, cadences, URLs
+│   ├── styles.py              # Dark/light Qt stylesheets
+│   ├── utils.py               # Timestamp formatting, link parsing
+│   ├── api.py                 # MerakiClient — API calls, pagination, retry
+│   ├── workers.py             # Background QThread workers
+│   ├── models.py              # Device table model + proxy filter model
+│   ├── delegates.py           # StatusDelegate (colored status dots)
+│   ├── health_dialog.py       # Health details dialog
+│   ├── timeline_dialog.py     # Alert timeline dialog
+│   ├── column_chooser.py      # Column chooser dialog
+│   ├── alerts_tab.py          # Alerts tab (groups + affected devices)
+│   └── app.py                 # MainWindow + main()
+├── run.py                     # Top-level launcher script
+├── requirements.txt           # Python dependencies
 └── README.md
 ```
 
