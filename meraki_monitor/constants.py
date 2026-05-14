@@ -20,6 +20,7 @@ BASE_COLUMNS: list[tuple[str, str]] = [
 # These fields come from the existing API responses at no extra cost.
 EXTRA_COLUMNS: list[tuple[str, str]] = [
     ("alertCount", "Alerts"),
+    ("networkName", "Network Name"),
     ("address", "Location"),
     ("notes", "Notes"),
     ("tags", "Tags"),

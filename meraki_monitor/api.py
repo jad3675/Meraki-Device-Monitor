@@ -99,6 +99,11 @@ class MerakiClient:
         url = f"{MERAKI_BASE_URL}/organizations/{self._org_id}/devices"
         return self._get_paginated(url, 1000, stop_event)
 
+    def fetch_networks(self, stop_event: threading.Event) -> list[dict]:
+        """Fetch all networks in the organization."""
+        url = f"{MERAKI_BASE_URL}/organizations/{self._org_id}/networks"
+        return self._get_paginated(url, 1000, stop_event)
+
     def fetch_statuses(self, stop_event: threading.Event) -> list[dict]:
         url = f"{MERAKI_BASE_URL}/organizations/{self._org_id}/devices/statuses"
         return self._get_paginated(url, 1000, stop_event)
@@ -186,6 +191,20 @@ class MerakiClient:
             tags = device.get("tags")
             if isinstance(tags, list):
                 device["tags"] = ", ".join(tags)
+
+        # Fetch network names
+        if progress_cb:
+            progress_cb("Fetching network names...")
+        try:
+            networks = self.fetch_networks(stop_event)
+        except MerakiAPIError:
+            networks = []
+        if stop_event.is_set():
+            return {"devices": [], "alerts_by_network": {}}
+
+        network_name_map = {n.get("id", ""): n.get("name", "") for n in networks}
+        for device in devices:
+            device["networkName"] = network_name_map.get(device.get("networkId", ""), "")
 
         if progress_cb:
             progress_cb("Fetching boot history...")
